@@ -14,6 +14,7 @@ mod switch;
 #[allow(clippy::module_inception)]
 mod task;
 
+use crate::config::MAX_SYSCALL_NUM;
 use crate::loader::{get_app_data, get_num_app};
 use crate::sync::UPSafeCell;
 use crate::trap::TrapContext;
@@ -126,11 +127,44 @@ impl TaskManager {
         inner.tasks[inner.current_task].get_trap_cx()
     }
 
+    /// Add one to the current task's count of `syscall_id`.
+    fn add_current_syscall_count(&self, syscall_id: usize) {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return;
+        }
+        let mut inner = self.inner.exclusive_access();
+        let current = inner.current_task;
+        inner.tasks[current].syscall_times[syscall_id] += 1;
+    }
+
+    /// How many times the current task has called `syscall_id`.
+    fn get_current_syscall_count(&self, syscall_id: usize) -> u32 {
+        if syscall_id >= MAX_SYSCALL_NUM {
+            return 0;
+        }
+        let inner = self.inner.exclusive_access();
+        inner.tasks[inner.current_task].syscall_times[syscall_id]
+    }
+
     /// Change the current 'Running' task's program break
     pub fn change_current_program_brk(&self, size: i32) -> Option<usize> {
         let mut inner = self.inner.exclusive_access();
         let cur = inner.current_task;
         inner.tasks[cur].change_program_brk(size)
+    }
+
+    /// mmap in the current task's address space
+    fn current_mmap(&self, start: usize, len: usize, prot: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.mmap(start, len, prot)
+    }
+
+    /// munmap in the current task's address space
+    fn current_munmap(&self, start: usize, len: usize) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.munmap(start, len)
     }
 
     /// Switch current `Running` task to the task we have found,
@@ -196,6 +230,26 @@ pub fn current_user_token() -> usize {
 /// Get the current 'Running' task's trap contexts.
 pub fn current_trap_cx() -> &'static mut TrapContext {
     TASK_MANAGER.get_current_trap_cx()
+}
+
+/// Add one to the current task's count of `syscall_id`.
+pub fn add_syscall_count(syscall_id: usize) {
+    TASK_MANAGER.add_current_syscall_count(syscall_id);
+}
+
+/// How many times the current task has called `syscall_id`.
+pub fn get_syscall_count(syscall_id: usize) -> u32 {
+    TASK_MANAGER.get_current_syscall_count(syscall_id)
+}
+
+/// mmap in the current task's address space
+pub fn current_mmap(start: usize, len: usize, prot: usize) -> isize {
+    TASK_MANAGER.current_mmap(start, len, prot)
+}
+
+/// munmap in the current task's address space
+pub fn current_munmap(start: usize, len: usize) -> isize {
+    TASK_MANAGER.current_munmap(start, len)
 }
 
 /// Change the current 'Running' task's program break
