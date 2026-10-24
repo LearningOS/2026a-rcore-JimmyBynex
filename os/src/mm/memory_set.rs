@@ -304,43 +304,52 @@ impl MemorySet {
                 return -1;
             }
         }
-        let (l, r) = (range.get_start(), range.get_end());
+        // Step 1: clear the PTEs. The page number alone finds each one.
+        for vpn in range {
+            self.page_table.unmap(vpn);
+        }
+
+        // Step 2: fix the areas. Each page's FrameTracker lives in some area's
+        // data_frames, and areas has no index by page, so look at every area.
+        let (req_start, req_end) = (range.get_start(), range.get_end());
         let mut i = 0;
         while i < self.areas.len() {
-            let (a, b) = (
-                self.areas[i].vpn_range.get_start(),
-                self.areas[i].vpn_range.get_end(),
-            );
-            // overlap of this area [a, b) with the request [l, r)
-            let (s, e) = (if a > l { a } else { l }, if b < r { b } else { r });
-            if s >= e {
+            let area = &mut self.areas[i];
+            let (area_start, area_end) = (area.vpn_range.get_start(), area.vpn_range.get_end());
+            // pages of this area that the request covers: [del_start, del_end)
+            let del_start = area_start.max(req_start);
+            let del_end = area_end.min(req_end);
+            if del_start >= del_end {
+                // request does not touch this area
                 i += 1;
                 continue;
             }
-            let area = &mut self.areas[i];
-            // dropping the FrameTracker returns each physical page to the allocator
-            for vpn in VPNRange::new(s, e) {
-                area.unmap_one(&mut self.page_table, vpn);
+            // every covered page is deleted: dropping its FrameTracker frees the frame
+            for vpn in VPNRange::new(del_start, del_end) {
+                area.data_frames.remove(&vpn);
             }
-            match (a < s, e < b) {
-                // whole area gone
+            // the area itself: removed only if fully covered, otherwise made smaller
+            let left_remains = area_start < del_start;
+            let right_remains = del_end < area_end;
+            match (left_remains, right_remains) {
+                // fully covered: remove the whole area
                 (false, false) => {
                     self.areas.remove(i);
                     continue;
                 }
-                // keep the left part [a, s)
-                (true, false) => area.vpn_range = VPNRange::new(a, s),
-                // keep the right part [e, b)
-                (false, true) => area.vpn_range = VPNRange::new(e, b),
-                // hole in the middle: left stays here, right becomes a new area
+                // only the left part is left
+                (true, false) => area.vpn_range = VPNRange::new(area_start, del_start),
+                // only the right part is left
+                (false, true) => area.vpn_range = VPNRange::new(del_end, area_end),
+                // hole in the middle: left part stays here, right part becomes a new area
                 (true, true) => {
                     let right = MapArea {
-                        vpn_range: VPNRange::new(e, b),
-                        data_frames: area.data_frames.split_off(&e),
+                        vpn_range: VPNRange::new(del_end, area_end),
+                        data_frames: area.data_frames.split_off(&del_end),
                         map_type: area.map_type,
                         map_perm: area.map_perm,
                     };
-                    area.vpn_range = VPNRange::new(a, s);
+                    area.vpn_range = VPNRange::new(area_start, del_start);
                     self.areas.push(right);
                 }
             }
