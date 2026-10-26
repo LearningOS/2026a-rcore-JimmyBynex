@@ -1,7 +1,7 @@
 //! Types related to task management & Functions for completely changing TCB
 use super::TaskContext;
 use super::{kstack_alloc, pid_alloc, KernelStack, PidHandle};
-use crate::config::TRAP_CONTEXT_BASE;
+use crate::config::{DEFAULT_PRIORITY, TRAP_CONTEXT_BASE};
 use crate::mm::{MemorySet, PhysPageNum, VirtAddr, KERNEL_SPACE};
 use crate::sync::UPSafeCell;
 use crate::trap::{trap_handler, TrapContext};
@@ -68,6 +68,12 @@ pub struct TaskControlBlockInner {
 
     /// Program break
     pub program_brk: usize,
+
+    /// Stride scheduling priority, at least 2
+    pub priority: usize,
+
+    /// Stride scheduling counter, the smallest one runs next
+    pub stride: usize,
 }
 
 impl TaskControlBlockInner {
@@ -90,7 +96,7 @@ impl TaskControlBlockInner {
 impl TaskControlBlock {
     /// Create a new process
     ///
-    /// At present, it is only used for the creation of initproc
+    /// Used for the creation of initproc and by sys_spawn
     pub fn new(elf_data: &[u8]) -> Self {
         // memory_set with elf program headers/trampoline/trap context/user stack
         let (memory_set, user_sp, entry_point) = MemorySet::from_elf(elf_data);
@@ -118,6 +124,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: user_sp,
                     program_brk: user_sp,
+                    priority: DEFAULT_PRIORITY,
+                    stride: 0,
                 })
             },
         };
@@ -191,6 +199,8 @@ impl TaskControlBlock {
                     exit_code: 0,
                     heap_bottom: parent_inner.heap_bottom,
                     program_brk: parent_inner.program_brk,
+                    priority: DEFAULT_PRIORITY,
+                    stride: 0,
                 })
             },
         });
