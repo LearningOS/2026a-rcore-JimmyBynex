@@ -289,6 +289,130 @@ impl MemorySet {
         self.areas.clear();
     }
 
+    /// Check a user range and turn it into [start_vpn, end_vpn).
+    /// Rules shared by mmap and munmap: start page-aligned, no overflow, and
+    /// the whole range stays in the user half (below 1 << 38).
+    /// len == 0 is allowed by the spec and gives an empty range.
+    fn user_vpn_range(start: usize, len: usize) -> Option<VPNRange> {
+        let start_va = VirtAddr::from(start);
+        if !start_va.aligned() {
+            return None;
+        }
+        let end = start.checked_add(len)?;
+        if end > 1 << 38 {
+            return None;
+        }
+        Some(VPNRange::new(start_va.floor(), VirtAddr::from(end).ceil()))
+    }
+
+    /// Is `vpn` a valid page that user mode may access?
+    fn user_page_mapped(&self, vpn: VirtPageNum) -> bool {
+        match self.page_table.translate(vpn) {
+            Some(pte) => pte.is_valid() && pte.flags().contains(PTEFlags::U),
+            None => false,
+        }
+    }
+
+    /// mmap for user: map [start, start+len) with permission `prot`
+    /// (bit0 R, bit1 W, bit2 X). Returns 0 on success, -1 on any illegal
+    /// argument or overlap; on failure the address space is unchanged.
+    pub fn mmap(&mut self, start: usize, len: usize, prot: usize) -> isize {
+        // Rule 1: aligned start, sane range
+        let Some(range) = Self::user_vpn_range(start, len) else { return -1 };
+        // Rule 2: prot must be non-empty and use only R/W/X bits.
+        // Must check before shifting: an extra bit 3 would turn into U.
+        if prot & !0x7 != 0 || prot & 0x7 == 0 {
+            return -1;
+        }
+        // Rule 3: no page in range may already be valid (unmapped PTEs stay
+        // in the table with V=0, so check validity, not existence).
+        // Without this, PageTable::map would panic the whole kernel.
+        for vpn in range {
+            if let Some(pte) = self.page_table.translate(vpn) {
+                if pte.is_valid() {
+                    return -1;
+                }
+            }
+        }
+        // len == 0: nothing to map, don't add an empty area
+        if range.get_start() == range.get_end() {
+            return 0;
+        }
+        // prot bit i → MapPermission bit i+1 (same layout as PTE flags), plus U
+        let perm = MapPermission::from_bits((prot << 1) as u8).unwrap() | MapPermission::U;
+        self.insert_framed_area(
+            VirtAddr::from(range.get_start()),
+            VirtAddr::from(range.get_end()),
+            perm,
+        );
+        0
+    }
+
+    /// munmap for user: unmap [start, start+len). Every page must currently be
+    /// mapped and user-accessible, otherwise -1 and nothing changes.
+    /// Frees only the requested pages; an area partly covered is shrunk or split.
+    pub fn munmap(&mut self, start: usize, len: usize) -> isize {
+        let Some(range) = Self::user_vpn_range(start, len) else { return -1 };
+        // Check everything first, so failure leaves the address space unchanged
+        for vpn in range {
+            if !self.user_page_mapped(vpn) {
+                return -1;
+            }
+        }
+        // Step 1: clear the PTEs. The page number alone finds each one.
+        for vpn in range {
+            self.page_table.unmap(vpn);
+        }
+
+        // Step 2: fix the areas. Each page's FrameTracker lives in some area's
+        // data_frames, and areas has no index by page, so look at every area.
+        let (req_start, req_end) = (range.get_start(), range.get_end());
+        let mut i = 0;
+        while i < self.areas.len() {
+            let area = &mut self.areas[i];
+            let (area_start, area_end) = (area.vpn_range.get_start(), area.vpn_range.get_end());
+            // pages of this area that the request covers: [del_start, del_end)
+            let del_start = area_start.max(req_start);
+            let del_end = area_end.min(req_end);
+            if del_start >= del_end {
+                // request does not touch this area
+                i += 1;
+                continue;
+            }
+            // every covered page is deleted: dropping its FrameTracker frees the frame
+            for vpn in VPNRange::new(del_start, del_end) {
+                area.data_frames.remove(&vpn);
+            }
+            // the area itself: removed only if fully covered, otherwise made smaller
+            let left_remains = area_start < del_start;
+            let right_remains = del_end < area_end;
+            match (left_remains, right_remains) {
+                // fully covered: remove the whole area
+                (false, false) => {
+                    self.areas.remove(i);
+                    continue;
+                }
+                // only the left part is left
+                (true, false) => area.vpn_range = VPNRange::new(area_start, del_start),
+                // only the right part is left
+                (false, true) => area.vpn_range = VPNRange::new(del_end, area_end),
+                // hole in the middle: left part stays here, right part becomes a new area
+                (true, true) => {
+                    let right = MapArea {
+                        vpn_range: VPNRange::new(del_end, area_end),
+                        data_frames: area.data_frames.split_off(&del_end),
+                        map_type: area.map_type,
+                        map_perm: area.map_perm,
+                    };
+                    area.vpn_range = VPNRange::new(area_start, del_start);
+                    self.areas.push(right);
+                }
+            }
+            i += 1;
+        }
+        0
+    }
+
     /// shrink the area to new_end
     #[allow(unused)]
     pub fn shrink_to(&mut self, start: VirtAddr, new_end: VirtAddr) -> bool {

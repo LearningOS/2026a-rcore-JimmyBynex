@@ -1,14 +1,16 @@
 //! Process management syscalls
 //!
 use alloc::sync::Arc;
+use core::mem::size_of;
 
 use crate::{
     fs::{open_file, OpenFlags},
-    mm::{translated_refmut, translated_str},
+    mm::{translated_byte_buffer, translated_refmut, translated_str},
     task::{
         add_task, current_task, current_user_token, exit_current_and_run_next,
-        suspend_current_and_run_next,
+        suspend_current_and_run_next, TaskControlBlock,
     },
+    timer::get_time_us,
 };
 
 #[repr(C)]
@@ -106,29 +108,49 @@ pub fn sys_waitpid(pid: isize, exit_code_ptr: *mut i32) -> isize {
 /// HINT: You might reimplement it with virtual memory management.
 /// HINT: What if [`TimeVal`] is splitted by two pages ?
 pub fn sys_get_time(_ts: *mut TimeVal, _tz: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_get_time NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
+    trace!("kernel:pid[{}] sys_get_time", current_task().unwrap().pid.0);
+    let us = get_time_us();
+    let sec = us / 1_000_000;
+    let usec = us % 1_000_000;
+    let tv = TimeVal { sec, usec };
+
+    let buffer = translated_byte_buffer(
+        current_user_token(),
+        _ts as *const u8,
+        size_of::<TimeVal>(),
     );
-    -1
+
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            &tv as *const TimeVal as *const u8,
+            size_of::<TimeVal>(),
+        )
+    };
+
+    let mut offset = 0;
+
+    for buf in buffer {
+        let len = buf.len();
+        buf.copy_from_slice(&bytes[offset..offset + len]);
+        offset += len;
+    }
+    0
 }
 
 /// YOUR JOB: Implement mmap.
-pub fn sys_mmap(_start: usize, _len: usize, _port: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_mmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_mmap(start: usize, len: usize, prot: usize) -> isize {
+    trace!("kernel:pid[{}] sys_mmap", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.mmap(start, len, prot)
 }
 
 /// YOUR JOB: Implement munmap.
-pub fn sys_munmap(_start: usize, _len: usize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_munmap NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_munmap(start: usize, len: usize) -> isize {
+    trace!("kernel:pid[{}] sys_munmap", current_task().unwrap().pid.0);
+    let task = current_task().unwrap();
+    let mut inner = task.inner_exclusive_access();
+    inner.memory_set.munmap(start, len)
 }
 
 /// change data segment size
@@ -143,19 +165,32 @@ pub fn sys_sbrk(size: i32) -> isize {
 
 /// YOUR JOB: Implement spawn.
 /// HINT: fork + exec =/= spawn
-pub fn sys_spawn(_path: *const u8) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_spawn NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_spawn(path: *const u8) -> isize {
+    trace!("kernel:pid[{}] sys_spawn", current_task().unwrap().pid.0);
+    let token = current_user_token();
+    let name = translated_str(token, path);
+
+    if let Some(app_inode) = open_file(name.as_str(), OpenFlags::RDONLY) {
+        let parent = current_task().unwrap();
+        let app_elf = app_inode.read_all();
+        let child = Arc::new(TaskControlBlock::new(app_elf.as_slice()));
+        child.inner_exclusive_access().parent = Some(Arc::downgrade(&parent));
+        parent.inner_exclusive_access().children.push(child.clone());
+        let child_pid = child.getpid();
+        add_task(child);
+        child_pid as isize
+    } else {
+        -1
+    }
 }
 
 // YOUR JOB: Set task priority.
-pub fn sys_set_priority(_prio: isize) -> isize {
-    trace!(
-        "kernel:pid[{}] sys_set_priority NOT IMPLEMENTED",
-        current_task().unwrap().pid.0
-    );
-    -1
+pub fn sys_set_priority(prio: isize) -> isize {
+    trace!("kernel:pid[{}] sys_set_priority", current_task().unwrap().pid.0);
+    if prio < 2 {
+        return -1;
+    }
+    let task = current_task().unwrap();
+    task.inner_exclusive_access().priority = prio as usize;
+    prio
 }
