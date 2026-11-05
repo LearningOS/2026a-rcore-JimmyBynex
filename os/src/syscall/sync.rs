@@ -2,6 +2,20 @@ use crate::sync::{Condvar, Mutex, MutexBlocking, MutexSpin, Semaphore};
 use crate::task::{block_current_and_run_next, current_process, current_task};
 use crate::timer::{add_timer, get_time_ms};
 use alloc::sync::Arc;
+
+/// Return value of lock/down when a deadlock is detected
+const DEADLOCK: isize = -0xDEAD;
+
+/// tid of the current thread
+fn current_tid() -> usize {
+    current_task()
+        .unwrap()
+        .inner_exclusive_access()
+        .res
+        .as_ref()
+        .unwrap()
+        .tid
+}
 /// sleep syscall
 pub fn sys_sleep(ms: usize) -> isize {
     trace!(
@@ -41,7 +55,7 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         Some(Arc::new(MutexBlocking::new()))
     };
     let mut process_inner = process.inner_exclusive_access();
-    if let Some(id) = process_inner
+    let id = if let Some(id) = process_inner
         .mutex_list
         .iter()
         .enumerate()
@@ -49,11 +63,16 @@ pub fn sys_mutex_create(blocking: bool) -> isize {
         .map(|(id, _)| id)
     {
         process_inner.mutex_list[id] = mutex;
-        id as isize
+        id
     } else {
         process_inner.mutex_list.push(mutex);
-        process_inner.mutex_list.len() as isize - 1
-    }
+        process_inner.mutex_list.len() - 1
+    };
+    // a mutex is a resource with exactly one unit
+    let table = &mut process_inner.mutex_table;
+    table.ensure(0, id);
+    table.available[id] = 1;
+    id as isize
 }
 /// mutex lock syscall
 pub fn sys_mutex_lock(mutex_id: usize) -> isize {
@@ -68,12 +87,28 @@ pub fn sys_mutex_lock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    // record the request, then check whether waiting could deadlock
+    let detect = process_inner.deadlock_detect;
+    let table = &mut process_inner.mutex_table;
+    table.ensure(tid, mutex_id);
+    table.need[tid][mutex_id] += 1;
+    if detect && !table.is_safe() {
+        table.need[tid][mutex_id] -= 1;
+        return DEADLOCK;
+    }
     drop(process_inner);
-    drop(process);
+    // may block here; must not hold process_inner while sleeping
     mutex.lock();
+    // woken up (or got it at once): the request becomes an allocation
+    let mut process_inner = process.inner_exclusive_access();
+    let table = &mut process_inner.mutex_table;
+    table.need[tid][mutex_id] -= 1;
+    table.allocation[tid][mutex_id] += 1;
+    table.available[mutex_id] -= 1;
     0
 }
 /// mutex unlock syscall
@@ -89,9 +124,15 @@ pub fn sys_mutex_unlock(mutex_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let mutex = Arc::clone(process_inner.mutex_list[mutex_id].as_ref().unwrap());
+    // give one unit back; a thread may up a semaphore it never took
+    let table = &mut process_inner.mutex_table;
+    table.ensure(tid, mutex_id);
+    table.allocation[tid][mutex_id] = table.allocation[tid][mutex_id].saturating_sub(1);
+    table.available[mutex_id] += 1;
     drop(process_inner);
     drop(process);
     mutex.unlock();
@@ -127,6 +168,10 @@ pub fn sys_semaphore_create(res_count: usize) -> isize {
             .push(Some(Arc::new(Semaphore::new(res_count))));
         process_inner.semaphore_list.len() - 1
     };
+    // a semaphore is a resource with res_count units
+    let table = &mut process_inner.sem_table;
+    table.ensure(0, id);
+    table.available[id] = res_count;
     id as isize
 }
 /// semaphore up syscall
@@ -142,9 +187,15 @@ pub fn sys_semaphore_up(sem_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
+    // give one unit back; a thread may up a semaphore it never took
+    let table = &mut process_inner.sem_table;
+    table.ensure(tid, sem_id);
+    table.allocation[tid][sem_id] = table.allocation[tid][sem_id].saturating_sub(1);
+    table.available[sem_id] += 1;
     drop(process_inner);
     sem.up();
     0
@@ -162,11 +213,28 @@ pub fn sys_semaphore_down(sem_id: usize) -> isize {
             .unwrap()
             .tid
     );
+    let tid = current_tid();
     let process = current_process();
-    let process_inner = process.inner_exclusive_access();
+    let mut process_inner = process.inner_exclusive_access();
     let sem = Arc::clone(process_inner.semaphore_list[sem_id].as_ref().unwrap());
+    // record the request, then check whether waiting could deadlock
+    let detect = process_inner.deadlock_detect;
+    let table = &mut process_inner.sem_table;
+    table.ensure(tid, sem_id);
+    table.need[tid][sem_id] += 1;
+    if detect && !table.is_safe() {
+        table.need[tid][sem_id] -= 1;
+        return DEADLOCK;
+    }
     drop(process_inner);
+    // may block here; must not hold process_inner while sleeping
     sem.down();
+    // woken up (or got it at once): the request becomes an allocation
+    let mut process_inner = process.inner_exclusive_access();
+    let table = &mut process_inner.sem_table;
+    table.need[tid][sem_id] -= 1;
+    table.allocation[tid][sem_id] += 1;
+    table.available[sem_id] -= 1;
     0
 }
 /// condvar create syscall
@@ -245,7 +313,14 @@ pub fn sys_condvar_wait(condvar_id: usize, mutex_id: usize) -> isize {
 /// enable deadlock detection syscall
 ///
 /// YOUR JOB: Implement deadlock detection, but might not all in this syscall
-pub fn sys_enable_deadlock_detect(_enabled: usize) -> isize {
-    trace!("kernel: sys_enable_deadlock_detect NOT IMPLEMENTED");
-    -1
+pub fn sys_enable_deadlock_detect(enabled: usize) -> isize {
+    trace!("kernel: sys_enable_deadlock_detect");
+    let enabled = match enabled {
+        0 => false,
+        1 => true,
+        _ => return -1,
+    };
+    let process = current_process();
+    process.inner_exclusive_access().deadlock_detect = enabled;
+    0
 }
